@@ -1,271 +1,383 @@
-import math
-from io import StringIO
-
-import pandas as pd
 import streamlit as st
+import pandas as pd
+import numpy as np
 
-st.set_page_config(page_title='투자 포트 & 매매일지 MVP', layout='wide')
+st.set_page_config(page_title="투자 포트 & 매매일지 MVP", layout="wide")
 
-st.title('투자 포트 해석기 + 매매일지 분석기')
-st.caption('수동 입력/CSV 업로드 기반의 가벼운 바이브 코딩 MVP')
+st.title("투자 포트 자동 해석기 + 매매일지 분석기")
+st.caption("수동 입력 기반 MVP | 숫자 변환 안정화 버전")
 
+# -----------------------------
+# 유틸
+# -----------------------------
+def safe_numeric(series):
+    return pd.to_numeric(series, errors="coerce")
 
-def to_num(x, default=0.0):
-    try:
-        if pd.isna(x):
-            return default
-        if isinstance(x, str):
-            x = x.replace('%', '').replace(',', '').strip()
-        return float(x)
-    except Exception:
-        return default
-
-
-def clamp(x, low=0, high=100):
-    return max(low, min(high, x))
-
-
-def growth_score(g):
-    # 0~100, 50% 성장률이면 매우 높게 반영
-    return clamp(g * 1.6)
-
-
-def psr_score(psr):
-    # 낮을수록 유리. 고성장주 감안해 완전 저PSR 편향은 줄임
-    if psr <= 2:
-        return 95
-    if psr <= 4:
-        return 85
-    if psr <= 7:
-        return 72
-    if psr <= 10:
-        return 58
-    if psr <= 15:
-        return 40
-    return 22
-
-
-def tam_score(tam):
-    # 사용자가 1~10으로 넣는다고 가정
-    return clamp(tam * 10)
-
-
-def margin_score(m):
-    # 영업이익률 -20~30 범위를 0~100으로 단순 매핑
-    return clamp((m + 20) * 2)
-
-
-def leverage_penalty(net_debt_to_cash):
-    # 순현금이면 음수 또는 0, 부채가 높을수록 패널티
-    if net_debt_to_cash <= 0:
+def score_growth(x):
+    if pd.isna(x):
         return 0
-    if net_debt_to_cash <= 0.5:
-        return 5
-    if net_debt_to_cash <= 1.0:
-        return 10
-    if net_debt_to_cash <= 2.0:
+    if x >= 80:
+        return 25
+    elif x >= 50:
+        return 22
+    elif x >= 30:
         return 18
-    return 28
+    elif x >= 15:
+        return 12
+    elif x >= 5:
+        return 7
+    return 3
 
+def score_psr(x):
+    if pd.isna(x):
+        return 0
+    if x <= 3:
+        return 20
+    elif x <= 6:
+        return 17
+    elif x <= 10:
+        return 13
+    elif x <= 15:
+        return 8
+    elif x <= 25:
+        return 4
+    return 1
 
-def conviction_bonus(note: str):
-    text = (note or '').lower()
-    bonus = 0
-    keywords = {
-        'backlog': 4,
-        'contract': 4,
-        'founder-led': 3,
-        'recurring': 4,
-        'moat': 5,
-        'platform': 3,
-        'fcf': 4,
-        'launch': 3,
-        'satellite': 3,
-        'ai': 3,
-        'bitcoin': 3,
-        'smr': 3,
-    }
-    for k, v in keywords.items():
-        if k in text:
-            bonus += v
-    return min(bonus, 12)
+def score_tam(x):
+    if pd.isna(x):
+        return 0
+    x = max(1, min(10, x))
+    return x * 2
 
+def score_margin(x):
+    if pd.isna(x):
+        return 0
+    if x >= 25:
+        return 15
+    elif x >= 15:
+        return 12
+    elif x >= 5:
+        return 8
+    elif x >= 0:
+        return 5
+    elif x >= -20:
+        return 2
+    return 0
 
-def risk_flag_text(row):
-    flags = []
-    if row['PSR'] >= 10:
-        flags.append('고밸류')
-    if row['영업이익률(%)'] < 0:
-        flags.append('적자')
-    if row['순부채/현금'] > 1:
-        flags.append('재무부담')
-    if row['매출성장률(%)'] < 15:
-        flags.append('성장둔화')
-    return ', '.join(flags) if flags else '양호'
+def score_balance(x):
+    """
+    순부채/현금:
+    양수 = 순현금 쪽으로 가정
+    음수 = 순부채 쪽으로 가정
+    """
+    if pd.isna(x):
+        return 0
+    if x >= 1.0:
+        return 15
+    elif x >= 0.3:
+        return 12
+    elif x >= 0:
+        return 9
+    elif x >= -0.5:
+        return 5
+    elif x >= -1.0:
+        return 2
+    return 0
 
+def total_score(row):
+    return (
+        score_growth(row["매출성장률(%)"])
+        + score_psr(row["PSR"])
+        + score_tam(row["TAM점수(1-10)"])
+        + score_margin(row["영업이익률(%)"])
+        + score_balance(row["순부채/현금"])
+    )
 
-def score_company(row):
-    gs = growth_score(row['매출성장률(%)'])
-    ps = psr_score(row['PSR'])
-    ts = tam_score(row['TAM점수(1-10)'])
-    ms = margin_score(row['영업이익률(%)'])
-    penalty = leverage_penalty(row['순부채/현금'])
-    bonus = conviction_bonus(row.get('메모', ''))
-
-    score = 0.34 * gs + 0.20 * ps + 0.20 * ts + 0.16 * ms + bonus - penalty
-    score = round(clamp(score), 1)
-
+def score_comment(score):
     if score >= 80:
-        verdict = '강한 후보'
+        return "매우 강함: 고성장 + 밸류/재무 균형이 꽤 좋음"
     elif score >= 65:
-        verdict = '관심 유지'
+        return "좋음: 성장성 뚜렷, 일부 밸류 부담 감안 가능"
     elif score >= 50:
-        verdict = '선별 접근'
-    else:
-        verdict = '보수적 접근'
+        return "보통 이상: 강점은 있으나 약점도 분명함"
+    elif score >= 35:
+        return "애매함: 선택적 접근 필요"
+    return "주의: 숫자상 리스크가 큼"
 
-    return pd.Series({
-        '성장점수': round(gs, 1),
-        '밸류점수': round(ps, 1),
-        '시장점수': round(ts, 1),
-        '수익성점수': round(ms, 1),
-        '최종점수': score,
-        '판정': verdict,
-        '리스크체크': risk_flag_text(row),
-    })
+def safe_bool_ratio(series):
+    if len(series) == 0:
+        return 0.0
+    mapped = series.astype(str).str.strip().str.lower().map(
+        {
+            "true": 1,
+            "false": 0,
+            "1": 1,
+            "0": 0,
+            "yes": 1,
+            "no": 0,
+            "y": 1,
+            "n": 0,
+            "예": 1,
+            "아니오": 0,
+        }
+    )
+    return mapped.fillna(0).mean()
 
+# -----------------------------
+# 기본 데이터
+# -----------------------------
+default_portfolio = pd.DataFrame(
+    [
+        {
+            "종목": "RKLB",
+            "매출성장률(%)": 45,
+            "PSR": 11,
+            "TAM점수(1-10)": 9,
+            "영업이익률(%)": -18,
+            "순부채/현금": 0.4,
+            "메모": "launch backlog platform founder-led",
+        },
+        {
+            "종목": "MSTR",
+            "매출성장률(%)": 70,
+            "PSR": 30,
+            "TAM점수(1-10)": 8,
+            "영업이익률(%)": -120,
+            "순부채/현금": -0.5,
+            "메모": "bitcoin leverage vehicle",
+        },
+        {
+            "종목": "CEG",
+            "매출성장률(%)": 18,
+            "PSR": 4,
+            "TAM점수(1-10)": 7,
+            "영업이익률(%)": 18,
+            "순부채/현금": 1.1,
+            "메모": "power recurring contract",
+        },
+    ]
+)
 
-def analyze_trades(df):
-    x = df.copy()
-    x['수익률(%)'] = x['수익률(%)'].apply(to_num)
-    x['보유일수'] = x['보유일수'].apply(lambda v: int(to_num(v, 0)))
-    x['추격매수'] = x['추격매수'].astype(str).str.lower().isin(['1', 'true', 'y', 'yes'])
-    x['계획준수'] = x['계획준수'].astype(str).str.lower().isin(['1', 'true', 'y', 'yes'])
-    x['손절규칙준수'] = x['손절규칙준수'].astype(str).str.lower().isin(['1', 'true', 'y', 'yes'])
+default_trades = pd.DataFrame(
+    [
+        {
+            "날짜": "2026-03-01",
+            "종목": "RKLB",
+            "수익률(%)": 12,
+            "추격매수": "False",
+            "계획준수": "True",
+            "손절규칙준수": "True",
+            "메모": "분할매수 잘함",
+        },
+        {
+            "날짜": "2026-03-05",
+            "종목": "MSTR",
+            "수익률(%)": -8,
+            "추격매수": "True",
+            "계획준수": "False",
+            "손절규칙준수": "False",
+            "메모": "흥분해서 추격",
+        },
+        {
+            "날짜": "2026-03-10",
+            "종목": "CEG",
+            "수익률(%)": 6,
+            "추격매수": "False",
+            "계획준수": "True",
+            "손절규칙준수": "True",
+            "메모": "계획대로 보유",
+        },
+    ]
+)
 
-    total = len(x)
-    win_rate = (x['수익률(%)'] > 0).mean() * 100 if total else 0
-    avg_return = x['수익률(%)'].mean() if total else 0
-    avg_win = x.loc[x['수익률(%)'] > 0, '수익률(%)'].mean() if (x['수익률(%)'] > 0).any() else 0
-    avg_loss = x.loc[x['수익률(%)'] <= 0, '수익률(%)'].mean() if (x['수익률(%)'] <= 0).any() else 0
-    plan_rate = x['계획준수'].mean() * 100 if total else 0
-    stop_rate = x['손절규칙준수'].mean() * 100 if total else 0
-    chase_rate = x['추격매수'].mean() * 100 if total else 0
+# -----------------------------
+# 탭 구성
+# -----------------------------
+tab1, tab2 = st.tabs(["포트 자동 해석기", "매매일지 분석기"])
 
-    bad_chase = x.loc[x['추격매수'], '수익률(%)'].mean() if x['추격매수'].any() else float('nan')
-    calm_trade = x.loc[~x['추격매수'], '수익률(%)'].mean() if (~x['추격매수']).any() else float('nan')
-
-    insights = []
-    if chase_rate >= 35:
-        insights.append('추격매수 비중이 높음 → 진입 기준선/분할매수 규칙 필요')
-    if plan_rate < 60:
-        insights.append('사전 계획 없이 들어간 비중이 큼 → 매수 이유/손절 기준을 먼저 적기')
-    if stop_rate < 60:
-        insights.append('손절 규칙 준수율이 낮음 → 최대 손실 허용치 사전 설정 필요')
-    if avg_loss < -8:
-        insights.append('평균 손실폭이 큼 → 손실은 짧게, 확신은 분할로')
-    if avg_win > 0 and avg_loss < 0 and abs(avg_win) < abs(avg_loss):
-        insights.append('손익비가 아쉬움 → 익절보다 손절 관리가 먼저')
-    if total >= 5 and not math.isnan(bad_chase) and not math.isnan(calm_trade) and bad_chase < calm_trade:
-        insights.append('추격매수 성과가 비추격보다 낮음 → 눌림/리테스트 구간 선호 전략 검토')
-    if not insights:
-        insights.append('기록 패턴은 비교적 안정적. 더 많은 샘플이 쌓이면 정확도가 올라감')
-
-    summary = {
-        '총 매매 수': int(total),
-        '승률(%)': round(win_rate, 1),
-        '평균 수익률(%)': round(avg_return, 2),
-        '평균 이익(%)': round(avg_win, 2) if not pd.isna(avg_win) else 0,
-        '평균 손실(%)': round(avg_loss, 2) if not pd.isna(avg_loss) else 0,
-        '계획준수율(%)': round(plan_rate, 1),
-        '손절규칙준수율(%)': round(stop_rate, 1),
-        '추격매수비율(%)': round(chase_rate, 1),
-        '추격매수 평균 수익률(%)': round(bad_chase, 2) if not pd.isna(bad_chase) else None,
-        '비추격매수 평균 수익률(%)': round(calm_trade, 2) if not pd.isna(calm_trade) else None,
-    }
-    return summary, insights
-
-
-def parse_csv(uploaded_file, default_df):
-    if uploaded_file is not None:
-        return pd.read_csv(uploaded_file)
-    return default_df.copy()
-
-
-sample_portfolio = pd.DataFrame([
-    {'종목': 'RKLB', '매출성장률(%)': 45, 'PSR': 11, 'TAM점수(1-10)': 9, '영업이익률(%)': -18, '순부채/현금': 0.4, '메모': 'launch backlog platform founder-led'},
-    {'종목': 'IONQ', '매출성장률(%)': 70, 'PSR': 30, 'TAM점수(1-10)': 8, '영업이익률(%)': -120, '순부채/현금': -0.5, '메모': 'ai moat platform'},
-    {'종목': 'CEG', '매출성장률(%)': 18, 'PSR': 4, 'TAM점수(1-10)': 7, '영업이익률(%)': 18, '순부채/현금': 1.1, '메모': 'power recurring contract'},
-])
-
-sample_trades = pd.DataFrame([
-    {'날짜': '2026-03-01', '종목': 'RKLB', '수익률(%)': 12, '보유일수': 24, '추격매수': False, '계획준수': True, '손절규칙준수': True, '메모': '리테스트 매수'},
-    {'날짜': '2026-03-03', '종목': 'IONQ', '수익률(%)': -9, '보유일수': 7, '추격매수': True, '계획준수': False, '손절규칙준수': False, '메모': '급등 따라감'},
-    {'날짜': '2026-03-08', '종목': 'BTC', '수익률(%)': 5, '보유일수': 11, '추격매수': False, '계획준수': True, '손절규칙준수': True, '메모': '분할 진입'},
-    {'날짜': '2026-03-12', '종목': 'OKLO', '수익률(%)': -14, '보유일수': 5, '추격매수': True, '계획준수': False, '손절규칙준수': False, '메모': '뉴스 보고 진입'},
-    {'날짜': '2026-03-16', '종목': 'RDW', '수익률(%)': 7, '보유일수': 18, '추격매수': False, '계획준수': True, '손절규칙준수': True, '메모': '눌림 매수'},
-])
-
-
-tab1, tab2 = st.tabs(['1) 포트 해석기', '2) 매매일지 분석기'])
-
+# =============================
+# 1. 포트 자동 해석기
+# =============================
 with tab1:
-    st.subheader('포트 자동 해석기')
-    st.write('종목별 성장/밸류/시장/수익성을 점수화해서 빠르게 보는 용도야.')
+    st.subheader("포트 CSV 업로드 또는 직접 입력")
 
-    uploaded = st.file_uploader('포트 CSV 업로드', type=['csv'], key='portfolio')
-    df = parse_csv(uploaded, sample_portfolio)
-    st.data_editor(df, num_rows='dynamic', use_container_width=True, key='portfolio_editor')
+    uploaded_port = st.file_uploader("포트 CSV 업로드", type=["csv"], key="portfolio_csv")
 
-    edited = st.session_state['portfolio_editor']
-    for col in ['매출성장률(%)', 'PSR', 'TAM점수(1-10)', '영업이익률(%)', '순부채/현금']:
-        edited[col] = edited[col].apply(to_num)
+    if uploaded_port is not None:
+        try:
+            portfolio_df = pd.read_csv(uploaded_port)
+        except Exception as e:
+            st.error(f"CSV 읽기 실패: {e}")
+            portfolio_df = default_portfolio.copy()
+    else:
+        portfolio_df = default_portfolio.copy()
 
-    scored = pd.concat([edited, edited.apply(score_company, axis=1)], axis=1)
-    scored = scored.sort_values('최종점수', ascending=False)
+    required_port_cols = [
+        "종목",
+        "매출성장률(%)",
+        "PSR",
+        "TAM점수(1-10)",
+        "영업이익률(%)",
+        "순부채/현금",
+        "메모",
+    ]
 
-    c1, c2, c3 = st.columns(3)
-    c1.metric('평균 점수', round(scored['최종점수'].mean(), 1))
-    c2.metric('최고 점수 종목', scored.iloc[0]['종목'])
-    c3.metric('강한 후보 수', int((scored['최종점수'] >= 80).sum()))
+    for col in required_port_cols:
+        if col not in portfolio_df.columns:
+            portfolio_df[col] = "" if col in ["종목", "메모"] else 0
 
-    st.dataframe(scored, use_container_width=True)
+    portfolio_df = portfolio_df[required_port_cols]
 
-    csv_data = scored.to_csv(index=False).encode('utf-8-sig')
-    st.download_button('점수 결과 CSV 다운로드', data=csv_data, file_name='portfolio_scored.csv', mime='text/csv')
+    edited_port = st.data_editor(
+        portfolio_df,
+        num_rows="dynamic",
+        use_container_width=True,
+        key="portfolio_editor",
+    )
 
+    numeric_cols = [
+        "매출성장률(%)",
+        "PSR",
+        "TAM점수(1-10)",
+        "영업이익률(%)",
+        "순부채/현금",
+    ]
+
+    # 여기서 안전하게 숫자 변환
+    for col in numeric_cols:
+        edited_port[col] = safe_numeric(edited_port[col])
+
+    edited_port["종목"] = edited_port["종목"].astype(str).fillna("")
+    edited_port["메모"] = edited_port["메모"].astype(str).fillna("")
+
+    # 종목 빈값 제거
+    scored_df = edited_port.copy()
+    scored_df = scored_df[scored_df["종목"].str.strip() != ""]
+
+    if len(scored_df) == 0:
+        st.info("종목을 1개 이상 입력해줘.")
+    else:
+        scored_df["총점"] = scored_df.apply(total_score, axis=1)
+        scored_df["해석"] = scored_df["총점"].apply(score_comment)
+        scored_df = scored_df.sort_values("총점", ascending=False).reset_index(drop=True)
+
+        st.subheader("점수 결과")
+        st.dataframe(scored_df, use_container_width=True)
+
+        st.subheader("상위 종목 코멘트")
+        for _, row in scored_df.iterrows():
+            st.markdown(
+                f"""
+**{row['종목']}** — {row['총점']}점  
+- 성장률: {row['매출성장률(%)']}
+- PSR: {row['PSR']}
+- TAM: {row['TAM점수(1-10)']}
+- 영업이익률: {row['영업이익률(%)']}
+- 순부채/현금: {row['순부채/현금']}
+- 메모: {row['메모']}
+- 판단: {row['해석']}
+"""
+            )
+
+# =============================
+# 2. 매매일지 분석기
+# =============================
 with tab2:
-    st.subheader('매매일지 분석기')
-    st.write('추격매수/계획준수/손절규칙 패턴을 잡아주는 용도야.')
+    st.subheader("매매일지 CSV 업로드 또는 직접 입력")
 
-    uploaded2 = st.file_uploader('매매일지 CSV 업로드', type=['csv'], key='trades')
-    tdf = parse_csv(uploaded2, sample_trades)
-    st.data_editor(tdf, num_rows='dynamic', use_container_width=True, key='trades_editor')
-    edited_t = st.session_state['trades_editor']
+    uploaded_trade = st.file_uploader("매매일지 CSV 업로드", type=["csv"], key="trade_csv")
 
-    summary, insights = analyze_trades(edited_t)
+    if uploaded_trade is not None:
+        try:
+            trades_df = pd.read_csv(uploaded_trade)
+        except Exception as e:
+            st.error(f"CSV 읽기 실패: {e}")
+            trades_df = default_trades.copy()
+    else:
+        trades_df = default_trades.copy()
 
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric('총 매매 수', summary['총 매매 수'])
-    c2.metric('승률', f"{summary['승률(%)']}%")
-    c3.metric('평균 수익률', f"{summary['평균 수익률(%)']}%")
-    c4.metric('추격매수 비율', f"{summary['추격매수비율(%)']}%")
+    required_trade_cols = [
+        "날짜",
+        "종목",
+        "수익률(%)",
+        "추격매수",
+        "계획준수",
+        "손절규칙준수",
+        "메모",
+    ]
 
-    st.write('### 요약 지표')
-    st.json(summary)
+    for col in required_trade_cols:
+        if col not in trades_df.columns:
+            trades_df[col] = ""
 
-    st.write('### 패턴 인사이트')
-    for item in insights:
-        st.write(f'- {item}')
+    trades_df = trades_df[required_trade_cols]
 
-    out = pd.DataFrame({'인사이트': insights})
-    st.download_button('인사이트 TXT 다운로드', data='\n'.join(insights), file_name='trade_insights.txt', mime='text/plain')
+    edited_trades = st.data_editor(
+        trades_df,
+        num_rows="dynamic",
+        use_container_width=True,
+        key="trade_editor",
+    )
 
-with st.expander('CSV 형식 가이드'):
-    st.markdown('''
-**포트 CSV 컬럼**  
-종목, 매출성장률(%), PSR, TAM점수(1-10), 영업이익률(%), 순부채/현금, 메모
+    edited_trades["수익률(%)"] = safe_numeric(edited_trades["수익률(%)"])
+    edited_trades["종목"] = edited_trades["종목"].astype(str).fillna("")
+    edited_trades["메모"] = edited_trades["메모"].astype(str).fillna("")
 
-**매매일지 CSV 컬럼**  
-날짜, 종목, 수익률(%), 보유일수, 추격매수, 계획준수, 손절규칙준수, 메모
-''')
+    analyzed = edited_trades.copy()
+    analyzed = analyzed[analyzed["종목"].str.strip() != ""]
+    analyzed = analyzed.dropna(subset=["수익률(%)"])
+
+    if len(analyzed) == 0:
+        st.info("매매일지를 1개 이상 입력해줘.")
+    else:
+        total_trades = len(analyzed)
+        win_rate = (analyzed["수익률(%)"] > 0).mean() * 100
+        avg_return = analyzed["수익률(%)"].mean()
+        chase_ratio = safe_bool_ratio(analyzed["추격매수"]) * 100
+        plan_ratio = safe_bool_ratio(analyzed["계획준수"]) * 100
+        stop_ratio = safe_bool_ratio(analyzed["손절규칙준수"]) * 100
+
+        c1, c2, c3 = st.columns(3)
+        c1.metric("총 매매 수", total_trades)
+        c2.metric("승률", f"{win_rate:.1f}%")
+        c3.metric("평균 수익률", f"{avg_return:.2f}%")
+
+        c4, c5, c6 = st.columns(3)
+        c4.metric("추격매수 비율", f"{chase_ratio:.1f}%")
+        c5.metric("계획준수율", f"{plan_ratio:.1f}%")
+        c6.metric("손절규칙 준수율", f"{stop_ratio:.1f}%")
+
+        st.subheader("패턴 해석")
+
+        insights = []
+
+        if chase_ratio >= 40:
+            insights.append("추격매수 비율이 높음 → 고점 진입 습관 점검 필요")
+        else:
+            insights.append("추격매수 비율이 낮은 편 → 진입 통제는 비교적 양호")
+
+        if plan_ratio < 60:
+            insights.append("계획준수율이 낮음 → 시나리오 없이 매매하는 비중이 있음")
+        else:
+            insights.append("계획준수율이 괜찮음 → 사전 기준을 잘 지키는 편")
+
+        if stop_ratio < 60:
+            insights.append("손절규칙 준수율이 낮음 → 손실 통제가 흔들릴 가능성")
+        else:
+            insights.append("손절규칙 준수율이 양호 → 리스크 관리 습관 괜찮음")
+
+        if avg_return < 0:
+            insights.append("평균 수익률이 음수 → 진입보다 청산 규칙 재점검 필요")
+        else:
+            insights.append("평균 수익률이 플러스 → 기본 매매 구조는 나쁘지 않음")
+
+        if win_rate < 50 and avg_return > 0:
+            insights.append("승률은 낮아도 손익비가 좋을 수 있음")
+        elif win_rate > 50 and avg_return < 0:
+            insights.append("승률은 높지만 크게 잃는 매매가 섞였을 수 있음")
+
+        for text in insights:
+            st.write(f"- {text}")
+
+        st.subheader("원본 매매일지")
+        st.dataframe(analyzed, use_container_width=True)
